@@ -6,12 +6,13 @@ input{width:100%;box-sizing:border-box;padding:9px;border:1px solid #cfbfc7;bord
 button{margin:6px 2px 0 0;padding:8px 10px;border:1px solid #c0aab7;border-radius:8px;background:white;cursor:pointer}
 #status{white-space:pre-wrap;overflow-wrap:anywhere;background:#fff0f3;padding:10px;border-radius:8px}
 </style><h2>渡信 · LetterFerry</h2>
+<small>诊断修复版 0.4.3 · 操作未收到回执时不要重复点击</small>
 <small>仅限本机实验。必须手动绑定当前 ChatGPT 标签页。</small>
 <label for="key">本地 Bridge 密钥（只存在浏览器扩展本地存储）</label>
 <input id="key" type="password" placeholder="粘贴 64 位本地密钥" autocomplete="off">
 <button id="save">保存密钥</button><button id="bind">绑定当前标签页</button>
 <div><button id="arm">启动网页接收</button><button id="stop">停止</button></div>
-<div><button id="inspect">检查页面结构（只读）</button></div>
+<div><button id="statusCheck">刷新连接状态（只读）</button><button id="inspect">检查页面结构（只读）</button></div>
 <p id="status">正在读取状态…</p>
 <small>不会自动发微信消息。关闭窗口不会关闭后台接收；点“停止”才能停止。网页与本地服务中断会失去就绪状态。</small>
 <script src="popup.js"></script></html>

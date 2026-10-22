@@ -201,7 +201,7 @@ async function main() {
   const binding = loadSessionBinding();
   const rl = createInterface({ input: stdin, output: stdout });
   try {
-    stdout.write('Arm ChatGPT Riven Chat Bridge Fixed Listener v7 Continuous separately in chat. The Host is not a background API.\n');
+    stdout.write('Arm the LetterFerry Chat Bridge Fixed Listener v7 Continuous separately in chat. The Host is not a background API.\n');
     const approval = await rl.question(`Foreground only: up to ${durationMs / 60_000} minutes / 20 new messages. Type START_WEIXIN_SESSION to continue: `);
     if (approval !== 'START_WEIXIN_SESSION') throw new Error('SESSION_NOT_APPROVED');
   } finally { rl.close(); }

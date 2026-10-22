@@ -49,7 +49,7 @@ test('activation marker must be fresh, exact, from bound peer and in an all-vali
  assert.throws(()=>selectActivationBatch([...batch,message('m2',marker)],{marker,accountId,peer}),/MULTIPLE_START_MARKERS/);
  assert.throws(()=>selectActivationBatch([message('m',marker,{from_user_id:'stranger'})],{marker,accountId,peer}),/UNEXPECTED_ACTIVATION_SENDER/);
  assert.throws(()=>selectActivationBatch([message('m',marker,{context_token:''})],{marker,accountId,peer}),/CONTEXT_TOKEN_REQUIRED/);
- assert.throws(()=>selectActivationBatch([message('m',marker,{item_list:[{type:2}]})],{marker,accountId,peer}),/EXACTLY_ONE_TEXT_ITEM_REQUIRED/);
+ assert.equal(selectActivationBatch([message('m',marker,{item_list:[{type:2}]})],{marker,accountId,peer}).found,false);
  assert.throws(()=>selectActivationBatch([message('m',marker)],{marker:'wrong',accountId,peer}),/INVALID_WEB_SESSION_MARKER/);
 });
 test('old allowed DMs and marker are durably deferred, never sent to ChatGPT',async()=>{
@@ -67,6 +67,101 @@ test('old allowed DMs and marker are durably deferred, never sent to ChatGPT',as
  assert.doesNotThrow(()=>auditWebSessionStart(f.store.list()));
  f.store.close();
 });
+test('activation safely archives an old image and older texts before the explicit start marker',()=>{
+ const f=fixture();
+ const img=message('image-old','discarded-placeholder',{context_token:undefined,
+   item_list:[{type:2,image_item:{secret:'MEDIA_BYTES_MUST_NOT_PERSIST'}}]});
+ const batch=[img,message('old-text-1','old text one'),message('old-text-2','old text two'),message('marker-1',marker)];
+ const plan=selectActivationBatch(batch,{marker,accountId,peer});
+ assert.equal(plan.found,true);
+ assert.equal(plan.unsupported.length,1);
+ const output=archiveActivationBatch({store:f.store,adapter:f.adapter,updates:plan.updates,marker,accountId,peer});
+ assert.deepEqual(output,{deferredNew:3,existingSafe:0,total:4,unsupportedNew:1,unsupportedExisting:0});
+ assert.equal(f.store.list().length,3);
+ assert.ok(f.store.list().every(e=>e.status==='DEFERRED_BACKLOG'));
+ assert.equal(f.store.next('RECEIVED'),undefined);
+ assert.deepEqual(f.store.unsupportedInboundCounts(),[{kind:'NON_TEXT_ITEM',count:1}]);
+ const held=f.store.db.prepare('SELECT * FROM adapter_unsupported_inbound').get();
+ assert.equal(JSON.stringify(held).includes('MEDIA_BYTES_MUST_NOT_PERSIST'),false);
+ assert.equal(f.real.commits,0);
+ assert.equal(f.real.sends.length,0);
+ assert.equal(f.bridge.enqueued.length,0);
+ f.store.close();
+});
+
+test('activation without exact pure-text marker never archives or advances an image batch',()=>{
+ const f=fixture();
+ const img=message('img-only','none',{item_list:[{type:2}]});
+ const falseMarker=message('mixed-marker','none',{item_list:[
+   {type:1,text_item:{text:marker}},{type:2,image_item:{data:'not-a-start-marker'}}
+ ]});
+ const planned=selectActivationBatch([img,falseMarker],{marker,accountId,peer});
+ assert.equal(planned.found,false);
+ assert.throws(()=>archiveActivationBatch({store:f.store,adapter:f.adapter,
+   updates:[img,falseMarker],marker,accountId,peer}),/WEB_SESSION_MARKER_NOT_IN_BATCH/);
+ assert.equal(f.store.list().length,0);
+ assert.deepEqual(f.store.unsupportedInboundCounts(),[]);
+ assert.equal(f.real.commits,0);
+ f.store.close();
+});
+
+test('activation archive rolls back unsupported and text together when a prior row conflicts',()=>{
+ const f=fixture();
+ const pending=f.adapter.ingestRaw(message('prior','pending reply')).event;
+ const img=message('new-image','none',{item_list:[{type:2}]});
+ assert.throws(()=>archiveActivationBatch({store:f.store,adapter:f.adapter,
+   updates:[img,message('prior','pending reply'),message('marker-new',marker)],
+   marker,accountId,peer}),/ARCHIVE_PREEXISTING_EVENT_NOT_TERMINAL/);
+ assert.equal(f.store.get(pending.id).status,'RECEIVED');
+ assert.deepEqual(f.store.unsupportedInboundCounts(),[]);
+ assert.equal(f.store.list().length,1);
+ assert.equal(f.real.commits,0);
+ f.store.close();
+});
+
+test('activation rejects reuse of one message ID as both media and text atomically',()=>{
+ const f=fixture();
+ const img=message('same-id','none',{item_list:[{type:2}]});
+ assert.throws(()=>archiveActivationBatch({store:f.store,adapter:f.adapter,
+   updates:[img,message('same-id','must not disappear'),message('marker-2',marker)],
+   marker,accountId,peer}),/INBOUND_TEXT_UNSUPPORTED_ID_CONFLICT/);
+ assert.deepEqual(f.store.unsupportedInboundCounts(),[]);
+ assert.equal(f.store.list().length,0);
+ assert.equal(f.real.commits,0);
+ f.store.close();
+});
+
+test('session does not commit a batch containing an unknown media type',async()=>{
+ const f=fixture();
+ const guard=guardedSessionTransport(f.real,accountId,peer,async()=>true,{store:f.store});
+ f.real.polls.push([message('picture','none',{item_list:[{type:2}]}),
+   message('unknown','none',{item_list:[{type:3}]}),message('text','normal text')]);
+ await assert.rejects(()=>guard.poll(),/SESSION_ITEMS_UNCLASSIFIED/);
+ assert.equal(f.real.commits,0);
+ assert.deepEqual(f.store.unsupportedInboundCounts(),[]);
+ assert.equal(f.store.list().length,0);
+ f.store.close();
+});
+
+test('activation rejects unknown type or malformed text even with a good marker and image',()=>{
+ const f=fixture();
+ const img=message('img-ok','none',{item_list:[{type:2}]});
+ for(const bad of [
+   message('bad-numeric','none',{item_list:[{type:99999}]}),
+   message('bad-target','hi',{to_user_id:'other'}),
+   message('bad-text','hi',{context_token:''}),
+   message('bad-id','none',{message_id:null,item_list:[{type:2}]}),
+   message('bad-mixed','hi',{item_list:[{type:1,text_item:{text:'x'}},{type:'unknown'}]})
+ ]){
+   assert.throws(()=>archiveActivationBatch({store:f.store,adapter:f.adapter,
+     updates:[img,bad,message('marker-ok',marker)],marker,accountId,peer}));
+   assert.equal(f.real.commits,0);
+   assert.deepEqual(f.store.unsupportedInboundCounts(),[]);
+   assert.equal(f.store.list().length,0);
+ }
+ f.store.close();
+});
+
 test('activation archive is atomic and leaves cursor untouched on a conflicting prior message',()=>{
  const f=fixture();
  f.adapter.ingestRaw(message('old1','a stored incomplete message'));
@@ -114,6 +209,107 @@ test('post-fence rejects malformed or foreign batches before cursor acknowledgem
  assert.throws(()=>assertPostFenceBatch([message('x','new DM',{from_user_id:'stranger'})],accountId,peer),/UNEXPECTED_SESSION_SENDER/);
  f.store.close();
 });
+test('paired image is durably quarantined while two same-batch texts still get one reply each',async()=>{
+ const f=fixture();
+ const media=message('img-1','ignored',{item_list:[{type:2,image_item:{data:'SECRET_IMAGE_PAYLOAD'}}]});
+ f.real.polls.push([media,message('t-1','first valid text'),message('t-2','second valid text')]);
+ let quarantine;
+ f.adapter.transport=guardedSessionTransport(f.real,accountId,peer,async()=>true,
+   {store:f.store,onQuarantine:value=>{quarantine=value;}});
+ let clock=0;
+ const result=await runBoundedSession({
+   adapter:f.adapter,store:f.store,clock:()=>clock,
+   sleep:async(ms)=>{clock+=Math.max(1,ms);},
+   durationMs:120,pollReserveMs:0,operationReserveMs:0,idleDelayMs:4
+ });
+ assert.deepEqual(quarantine,{count:1,newlyRecorded:1});
+ assert.deepEqual(f.store.unsupportedInboundCounts(),[{kind:'NON_TEXT_ITEM',count:1}]);
+ assert.equal(result.acceptedUnique,2);
+ assert.equal(result.repliesSent,2);
+ assert.equal(f.real.sends.length,2);
+ assert.equal(f.bridge.enqueued.length,2);
+ assert.match(f.bridge.enqueued[0].text,/first valid text$/);
+ assert.match(f.bridge.enqueued[1].text,/second valid text$/);
+ assert.ok(f.real.commits>=1);
+ assert.equal(f.store.list().length,2);
+ const saved=f.store.db.prepare('SELECT * FROM adapter_unsupported_inbound').get();
+ assert.equal(saved.status,'QUARANTINED_NO_REPLY');
+ assert.equal(JSON.stringify(saved).includes('SECRET_IMAGE_PAYLOAD'),false);
+ assert.equal(JSON.stringify(saved).includes('private-img-1'),false);
+ f.store.close();
+});
+
+test('unsupported replay is idempotent, never replies and never consumes message quota',async()=>{
+ const f=fixture();
+ const image=message('img-repeat','not-text',{item_list:[{type:2,image_item:{media_id:'opaque-image'}}]});
+ const text=message('text-repeat','valid text');
+ f.real.polls.push([image,text],[structuredClone(image),structuredClone(text)]);
+ f.adapter.transport=guardedSessionTransport(f.real,accountId,peer,async()=>true,{store:f.store});
+ let clock=0;
+ const result=await runBoundedSession({
+   adapter:f.adapter,store:f.store,clock:()=>clock,
+   sleep:async(ms)=>{clock+=Math.max(1,ms);},
+   durationMs:120,pollReserveMs:0,operationReserveMs:0,idleDelayMs:4
+ });
+ assert.equal(result.acceptedUnique,1);
+ assert.equal(result.duplicateAccepted,1);
+ assert.equal(result.repliesSent,1);
+ assert.equal(f.bridge.enqueued.length,1);
+ assert.equal(f.real.sends.length,1);
+ assert.deepEqual(f.store.unsupportedInboundCounts(),[{kind:'NON_TEXT_ITEM',count:1}]);
+ f.store.close();
+});
+
+test('quarantine survives a fresh database connection and a cursor replay remains idempotent',async()=>{
+ const f=fixture();
+ const media=message('persist-image','not-text',{item_list:[{type:2,image_item:{secret:'NEVER_PERSIST'}}]});
+ f.real.polls.push([media]);
+ const guarded=guardedSessionTransport(f.real,accountId,peer,async()=>true,{store:f.store});
+ assert.deepEqual(await guarded.poll(),[]);
+ assert.equal(f.real.commits,0); // ack intentionally withheld by this test
+ const filename=f.store.filename;
+ f.store.close();
+ const reopened=new AdapterStore(filename);
+ const replay={poll:async()=>[structuredClone(media)],commits:0,
+   async commitPoll(){this.commits++;},async sendText(){throw Error('MEDIA_MUST_NEVER_SEND');}};
+ const second=guardedSessionTransport(replay,accountId,peer,async()=>true,{store:reopened});
+ assert.deepEqual(await second.poll(),[]);
+ await second.commitPoll();
+ assert.equal(replay.commits,1);
+ assert.deepEqual(reopened.unsupportedInboundCounts(),[{kind:'NON_TEXT_ITEM',count:1}]);
+ const saved=reopened.db.prepare('SELECT * FROM adapter_unsupported_inbound').get();
+ assert.equal(JSON.stringify(saved).includes('NEVER_PERSIST'),false);
+ assert.equal(reopened.list().length,0);
+ reopened.close();
+});
+
+test('unsupported/mixed items require durable quarantine and malformed identity never advances cursor',async()=>{
+ const f=fixture();
+ const image=message('img','unused',{item_list:[{type:2}]});
+ assert.throws(()=>assertPostFenceBatch([image],accountId,peer),/REQUIRE_QUARANTINE/);
+ f.real.polls.push([image]);
+ const noStore=guardedSessionTransport(f.real,accountId,peer,async()=>true);
+ await assert.rejects(()=>noStore.poll(),/QUARANTINE_REQUIRED/);
+ assert.equal(f.real.commits,0);
+ const mixed=message('mixed','not-a-pure-text',{item_list:[
+   {type:1,text_item:{text:'KEEP_ME_UNPROCESSED'}},{type:2,image_item:{data:'image'}}]});
+ f.real.polls.push([mixed]);
+ const guarded=guardedSessionTransport(f.real,accountId,peer,async()=>true,{store:f.store});
+ assert.deepEqual(await guarded.poll(),[]);
+ assert.deepEqual(f.store.unsupportedInboundCounts(),[{kind:'MIXED_ITEM_TYPES',count:1}]);
+ assert.equal(f.store.list().length,0);
+ f.real.polls.push([image,message('later','valid'),message('bad','broken',{item_list:[{type:2}],message_id:null})]);
+ await assert.rejects(()=>guarded.poll(),/MESSAGE_ID_INVALID/);
+ assert.equal(f.store.unsupportedInboundCounts()[0].count,1);
+ assert.equal(f.real.commits,0);
+ // A conflicting reuse of a recorded text ID cannot silently convert it into media.
+ f.adapter.ingestRaw(message('same-id','saved plain text'));
+ f.real.polls.push([message('same-id','media',{item_list:[{type:2}]})]);
+ await assert.rejects(()=>guarded.poll(),/UNSUPPORTED_INBOUND_TEXT_ID_CONFLICT/);
+ assert.equal(f.real.commits,0);
+ f.store.close();
+});
+
 test('session Host health enforces arm and rejects unknown browser delivery',()=>{
  assert.equal(assertSessionWebHealth({ok:true,host:'HOST_READY',queue:{SUCCEEDED:1}}),true);
  assert.throws(()=>assertSessionWebHealth({ok:true,host:'HOST_UNVERIFIED',queue:{}}),/DISCONNECTED/);

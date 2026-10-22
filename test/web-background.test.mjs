@@ -7,7 +7,7 @@ import {dirname,join} from 'node:path';
 
 const source=readFileSync(join(dirname(fileURLToPath(import.meta.url)),'../web-extension/background.js'),'utf8');
 const chat='https://chatgpt.com/g/g-p-test/c/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
-function setup({down=false,missingReceiver=false,oneEvent=false,deliverError=null,autoEnabled=false,editorBusyWhileActive=false,taskStatus='BROWSER_SUBMITTED'}={}){
+function setup({down=false,missingReceiver=false,oneEvent=false,deliverError=null,autoEnabled=false,editorBusyWhileActive=false,taskStatus='BROWSER_SUBMITTED',healthHost='HOST_READY',pendingUnknown=false,ownerMatched=true,surveyNeverReturns=false,preflightNeverReturns=false}={}){
  let listener,alarm,receiverLoaded=!missingReceiver,injections=0,polled=false;
  let tab={id:22,url:chat};
  const session={},local={},calls=[];
@@ -23,8 +23,14 @@ function setup({down=false,missingReceiver=false,oneEvent=false,deliverError=nul
      async sendMessage(_id,message){
        if(!receiverLoaded) throw Error('Could not establish connection. Receiving end does not exist.');
        if(['deliver','start-delivery'].includes(message.action) && deliverError) throw Error(deliverError);
-       if(message.action==='preflight')return {receiverVersion:7,ready:!(editorBusyWhileActive&&session.activeEventId),reason:editorBusyWhileActive&&session.activeEventId?'ASSISTANT_GENERATING':'READY'};
-       if(message.action==='survey')return {receiverVersion:7,ready:true,classicAssistant:0,groupedAssistant:2,groupedUser:3,roleAssistant:2,roleUser:3,lastAssistantBodyNodes:1,lastAssistantRecognizedBody:1,lastAssistantLabelOnly:0,assistantsWithBody:2,lastAssistantDescendants:9,lastAssistantBlockElements:1,lastAssistantParentBodyNodes:1};
+       if(message.action==='preflight'){
+         if(preflightNeverReturns)return new Promise(()=>{});
+         return {receiverVersion:8,ready:!(editorBusyWhileActive&&session.activeEventId),reason:editorBusyWhileActive&&session.activeEventId?'ASSISTANT_GENERATING':'READY'};
+       }
+       if(message.action==='survey'){
+         if(surveyNeverReturns)return new Promise(()=>{});
+         return {receiverVersion:8,ready:true,classicAssistant:0,groupedAssistant:2,groupedUser:3,roleAssistant:2,roleUser:3,lastAssistantBodyNodes:1,lastAssistantRecognizedBody:1,lastAssistantLabelOnly:0,assistantsWithBody:2,assistantBodySampled:2,lastAssistantDescendants:9,lastAssistantBlockElements:1,lastAssistantParentBodyNodes:1};
+       }
        if(message.action==='start-delivery')return {accepted:true};
        return {ok:true,reply:'fake response'};
      }
@@ -38,10 +44,14 @@ function setup({down=false,missingReceiver=false,oneEvent=false,deliverError=nul
  };
  async function fakeFetch(url,options){
    if(down)throw Error('LOCAL_HOST_DOWN');
-   const parsed=JSON.parse(options.body);
+   const parsed=options.body?JSON.parse(options.body):{};
    const endpoint=new URL(url).pathname;
    calls.push({endpoint,data:parsed});
-   const result=endpoint==='/extension/task-status'
+   const result=endpoint==='/health'
+     ? {ok:true,host:healthHost,queue:pendingUnknown?{DELIVERY_UNKNOWN:1}:{}}
+     : endpoint==='/extension/owner-status'
+     ? {host:healthHost,ownerMatches:ownerMatched,pendingBrowserDelivery:pendingUnknown}
+     : endpoint==='/extension/task-status'
      ? {status:taskStatus}
      : endpoint==='/extension/auto-state'
      ? {enabled:autoEnabled,chatUrl:autoEnabled?chat:null}
@@ -50,7 +60,7 @@ function setup({down=false,missingReceiver=false,oneEvent=false,deliverError=nul
      : {status:endpoint.endsWith('disarm')?'STOPPED':'HOST_READY'};
    return {ok:true,async json(){return result;}};
  }
- vm.runInNewContext(source,{chrome,URL,fetch:fakeFetch,AbortSignal:{timeout(){return undefined;}},setTimeout(){return 1;},clearTimeout(){}});
+ vm.runInNewContext(source,{chrome,URL,fetch:fakeFetch,AbortSignal:{timeout(){return undefined;}},setTimeout(callback,ms){if((ms===4500&&surveyNeverReturns)||(ms===4000&&preflightNeverReturns))queueMicrotask(callback);return 1;},clearTimeout(){}});
  function command(command,payload={},sender={}){return new Promise(resolve=>listener({command,...payload},sender,resolve));}
  return {command,session,local,calls,injections:()=>injections,changeTab(url){tab={id:22,url};},triggerAlarm:()=>alarm?.({name:'bridge-check'}),drain:()=>new Promise(done=>setImmediate(done))};
 }
@@ -81,6 +91,17 @@ test('background arm requires live localhost Host; stop clears readiness',async(
  assert.match(stopped.message,/已停止/);
  assert.equal(f.session.armed,false);
  assert.ok(f.calls.some(c=>c.endpoint==='/extension/disarm'));
+});
+test('hung receiver preflight fails closed without claiming readiness, injection or heartbeat',async()=>{
+ const f=setup({preflightNeverReturns:true});
+ f.session.boundTabId=22;f.session.boundUrl=chat;f.session.armed=false;
+ await f.command('save-key',{key:'f'.repeat(64)});
+ const result=await f.command('arm');
+ assert.match(result.message,/页面接收脚本超时/);
+ assert.equal(f.session.armed,false);
+ assert.equal(f.calls.filter(x=>x.endpoint==='/extension/heartbeat').length,0);
+ assert.equal(f.calls.filter(x=>x.endpoint==='/extension/poll').length,0);
+ assert.equal(f.injections(),0);
 });
 test('background fails closed if local Host cannot be contacted',async()=>{
  const f=setup({down:true});
@@ -151,6 +172,68 @@ test('read-only page structure inspector is scoped to bound tab, sends no messag
  assert.match((await f.command('inspect')).message,/已变化/);
 });
 
+test('read-only connection status distinguishes real local readiness from a Weixin delivery proof',async()=>{
+ const f=setup({healthHost:'HOST_READY'});
+ await f.command('save-key',{key:'f'.repeat(64)});
+ await f.command('bind');
+ await f.command('arm');
+ for(let n=0;n<8;n++)await f.drain();
+ const before=f.calls.length;
+ const report=await f.command('status');
+ assert.match(report.message,/Host：已收到浏览器心跳/);
+ assert.match(report.message,/Host 所属标签页：与本扩展精确匹配/);
+ assert.match(report.message,/浏览器页面：接收脚本与页面可用/);
+ assert.match(report.message,/本地检查：基础条件正常（尚未验证微信实收）/);
+ assert.equal(f.calls.slice(before).every(c=>['/health','/extension/owner-status'].includes(c.endpoint)),true);
+ assert.equal(f.calls.slice(before).filter(c=>c.endpoint==='/extension/poll').length,0);
+});
+test('a Host heartbeat from another owner cannot be reported as locally ready',async()=>{
+ const f=setup({healthHost:'HOST_READY',ownerMatched:false});
+ await f.command('save-key',{key:'f'.repeat(64)});
+ await f.command('bind');await f.command('arm');
+ const report=await f.command('status');
+ assert.match(report.message,/Host 所属标签页：尚未核验或不匹配/);
+ assert.match(report.message,/未完全就绪/);
+ assert.equal(f.calls.filter(c=>c.endpoint==='/extension/poll').length,0);
+});
+test('read-only status warns on unavailable heartbeat or uncertain delivery',async()=>{
+ for(const opts of [{healthHost:'HOST_UNVERIFIED'},{pendingUnknown:true}]){
+  const f=setup(opts);
+  await f.command('save-key',{key:'f'.repeat(64)});
+  await f.command('bind');
+  await f.command('arm');
+  for(let n=0;n<6;n++)await f.drain();
+  const report=await f.command('status');
+  assert.match(report.message,/未完全就绪/);
+  if(opts.healthHost==='HOST_UNVERIFIED')assert.match(report.message,/心跳未验证/);
+  if(opts.pendingUnknown)assert.match(report.message,/需要等待或人工核查/);
+ }
+});
+test('read-only status does not inject receiver or expose bound URL and secrets',async()=>{
+ const f=setup({missingReceiver:true,healthHost:'HOST_UNVERIFIED'});
+ f.session.boundTabId=22;f.session.boundUrl=chat;f.session.armed=true;
+ f.local.localBridgeKey='f'.repeat(64);
+ const result=await f.command('status');
+ assert.equal(f.injections(),0);
+ assert.equal(f.calls.filter(c=>c.endpoint==='/extension/poll').length,0);
+ assert.match(result.message,/页面接收脚本未响应/);
+ assert.equal(result.message.includes(chat),false);
+ assert.equal(result.message.includes('f'.repeat(64)),false);
+ assert.match(result.message,/未完全就绪/);
+});
+
+test('hung page survey returns bounded timeout and does not change listener or send anything',async()=>{
+ const f=setup({surveyNeverReturns:true});
+ await f.command('bind');
+ const before=f.calls.length;
+ const result=await f.command('inspect');
+ assert.match(result.message,/检查超时/);
+ assert.match(result.message,/没有更改监听或发送消息/);
+ assert.equal(f.session.armed,false);
+ assert.equal(f.calls.slice(before).filter(x=>x.endpoint==='/extension/poll').length,0);
+ assert.equal(f.calls.slice(before).filter(x=>x.endpoint==='/extension/complete').length,0);
+});
+
 test('autostart restores only the owner-pinned ChatGPT tab after authorized Host confirmation',async()=>{
  const f=setup({autoEnabled:true});
  await f.command('save-key',{key:'f'.repeat(64)});
@@ -162,6 +245,45 @@ test('autostart restores only the owner-pinned ChatGPT tab after authorized Host
  assert.ok(f.calls.some(c=>c.endpoint==='/extension/auto-state'));
  assert.ok(f.calls.some(c=>c.endpoint==='/extension/heartbeat'));
 });
+test('auto-managed stale tab is disarmed without replay and can restore only exact pinned URL',async()=>{
+ const f=setup({autoEnabled:true});
+ await f.command('save-key',{key:'f'.repeat(64)});
+ f.triggerAlarm();for(let n=0;n<10;n++)await f.drain();
+ assert.equal(f.session.armed,true);
+ assert.equal(f.session.autoManaged,true);
+ const wrong='https://chatgpt.com/c/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+ f.changeTab(wrong);
+ for(let attempt=0;attempt<5&&f.session.armed;attempt++){
+  f.triggerAlarm();for(let n=0;n<16;n++)await f.drain();
+ }
+ assert.equal(f.session.armed,false,JSON.stringify({autoManaged:f.session.autoManaged,active:Boolean(f.session.activeEventId),disarmCount:f.calls.filter(x=>x.endpoint==='/extension/disarm').length,autoChecks:f.calls.filter(x=>x.endpoint==='/extension/auto-state').length}));
+ assert.equal(f.session.autoManaged,false);
+ assert.equal(f.session.boundTabId,null);
+ assert.ok(f.calls.some(x=>x.endpoint==='/extension/disarm'));
+ assert.equal(f.calls.filter(x=>x.endpoint==='/extension/unknown').length,0);
+ f.changeTab(chat);
+ for(let attempt=0;attempt<5&&!f.session.armed;attempt++){
+  f.triggerAlarm();for(let n=0;n<16;n++)await f.drain();
+ }
+ assert.equal(f.session.armed,true);
+ assert.equal(f.session.boundUrl,chat);
+ assert.equal(f.local.manualAutoPause,undefined);
+});
+
+test('stale tab never automatically disarms a possibly submitted active message',async()=>{
+ const f=setup({autoEnabled:true,oneEvent:true});
+ await f.command('save-key',{key:'f'.repeat(64)});
+ f.triggerAlarm();for(let n=0;n<16;n++)await f.drain();
+ assert.equal(f.session.activeEventId,'offline-test-event');
+ const count=f.calls.filter(x=>x.endpoint==='/extension/disarm').length;
+ f.changeTab('https://chatgpt.com/c/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb');
+ f.triggerAlarm();for(let n=0;n<12;n++)await f.drain();
+ assert.equal(f.session.activeEventId,'offline-test-event');
+ assert.equal(f.session.armed,true);
+ assert.equal(f.calls.filter(x=>x.endpoint==='/extension/disarm').length,count);
+ assert.equal(f.calls.filter(x=>x.endpoint==='/extension/unknown').length,0);
+});
+
 test('manual Stop blocks automatic re-arming of the same tab',async()=>{
  const f=setup({autoEnabled:true});
  await f.command('save-key',{key:'f'.repeat(64)});

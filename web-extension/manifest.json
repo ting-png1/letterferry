@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "LetterFerry · 渡信 (Local Lab)",
-  "version": "0.3.0",
+  "version": "0.4.3",
   "description": "Local opt-in Weixin to ChatGPT bridge; developer preview.",
   "permissions": [
     "storage",
@@ -29,6 +29,6 @@
   ],
   "action": {
     "default_popup": "popup.html",
-    "default_title": "Riven Weixin Bridge"
+    "default_title": "LetterFerry · 渡信"
   }
 }

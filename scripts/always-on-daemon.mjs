@@ -50,7 +50,10 @@ async function initialFence({store,adapter,transport,accountId,peer}){
  const summary=durableStartupBatch({store,adapter,updates:batch,accountId,peer});
  enabled();
  await transport.commitPoll();
- process.stdout.write('ALWAYS_ON_STARTUP_FENCE deferred='+summary.newlyDeferred+' already='+summary.alreadyStored+'\n');
+ process.stdout.write('ALWAYS_ON_STARTUP_FENCE deferred='+summary.newlyDeferred+
+   ' already='+summary.alreadyStored+
+   ' unsupported_held='+(summary.unsupportedNew||0)+
+   ' unsupported_replayed='+(summary.unsupportedExisting||0)+'\n');
 }
 async function sessionLoop({store,adapter,raw,peer,accountId,progress,key}){
  let cycle=0;
@@ -61,7 +64,10 @@ async function sessionLoop({store,adapter,raw,peer,accountId,progress,key}){
     graceMs:60_000,retryMs:1000,onPause:()=>process.stdout.write('ALWAYS_ON_WAIT_HOST\n')});
   const guarded=guardedSessionTransport(raw,accountId,peer,()=>
     waitForWebHostRecovery({check:async()=>{enabled();await hostReady();},
-      graceMs:60_000,retryMs:500}));
+      graceMs:60_000,retryMs:500}),
+    {store,onQuarantine:({count,newlyRecorded})=>
+      process.stdout.write('ALWAYS_ON_UNSUPPORTED_QUARANTINED count='+count+
+        ' new='+newlyRecorded+' no_reply=TRUE\n')});
   adapter.transport={
     poll:async()=>{const batch=await guarded.poll();enabled();return batch;},
     commitPoll:async()=>{enabled();return guarded.commitPoll();},

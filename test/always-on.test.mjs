@@ -55,6 +55,85 @@ test('startup backlog is atomically saved as deferred and never sent or bridged'
  assert.deepEqual(duplicated,{newlyDeferred:0,alreadyStored:2,total:2});
  f.store.close();
 });
+test('always-on startup quarantines old image and preserves nearby texts without sending',()=>{
+ const f=fixture();
+ const image=raw('old-media','ignored',{context_token:undefined,
+   item_list:[{type:2,image_item:{data:'UNSAVED_MEDIA_SECRET'}}]});
+ const batch=[image,raw('old-1','old text 1'),raw('old-2','old text 2')];
+ const result=durableStartupBatch({store:f.store,adapter:f.adapter,updates:batch,accountId,peer});
+ assert.deepEqual(result,{newlyDeferred:2,alreadyStored:0,total:3,unsupportedNew:1,unsupportedExisting:0});
+ assert.deepEqual(f.store.list().map(r=>r.status),['DEFERRED_BACKLOG','DEFERRED_BACKLOG']);
+ assert.equal(f.store.next('RECEIVED'),undefined);
+ assert.deepEqual(f.store.unsupportedInboundCounts(),[{kind:'NON_TEXT_ITEM',count:1}]);
+ const media=f.store.db.prepare('SELECT * FROM adapter_unsupported_inbound').get();
+ assert.equal(JSON.stringify(media).includes('UNSAVED_MEDIA_SECRET'),false);
+ assert.equal(JSON.stringify(media).includes('token-'),false);
+ const replay=durableStartupBatch({store:f.store,adapter:f.adapter,updates:batch,accountId,peer});
+ assert.deepEqual(replay,{newlyDeferred:0,alreadyStored:2,total:3,unsupportedNew:0,unsupportedExisting:1});
+ f.store.close();
+});
+
+test('always-on image isolation survives sqlite reopen without replaying or retaining payload',()=>{
+ const f=fixture(),filename=f.store.filename;
+ const image=raw('image-on-reboot','ignore',{item_list:[{type:2,image_item:{secret:'NO_PERSIST'}}]});
+ durableStartupBatch({store:f.store,adapter:f.adapter,updates:[image],accountId,peer});
+ f.store.close();
+ const reopened=new AdapterStore(filename);
+ const adapter=new WeixinBridgeAdapter({accountId,policy:new AllowlistPolicy({accountId,allowedPeers:[peer]}),
+   store:reopened,encryptionKey:Buffer.alloc(32,7),transport:{},bridge:{}});
+ const result=durableStartupBatch({store:reopened,adapter,updates:[image],accountId,peer});
+ assert.deepEqual(result,{newlyDeferred:0,alreadyStored:0,total:1,unsupportedNew:0,unsupportedExisting:1});
+ assert.deepEqual(reopened.unsupportedInboundCounts(),[{kind:'NON_TEXT_ITEM',count:1}]);
+ assert.equal(JSON.stringify(reopened.db.prepare('SELECT * FROM adapter_unsupported_inbound').get()).includes('NO_PERSIST'),false);
+ reopened.close();
+});
+
+test('always-on startup malformed member fails whole media+text batch without cursor effects',()=>{
+ const f=fixture();
+ const media=raw('media','none',{item_list:[{type:2}]});
+ for(const bad of [
+  raw('wrong-target','text',{to_user_id:'different-account'}),
+  raw('missing-context','text',{context_token:''}),
+  raw('missing-media-id','none',{message_id:null,item_list:[{type:2}]}),
+  raw('unknown-item','none',{item_list:[{type:50000}]}),
+  raw('stranger','text',{from_user_id:'another-peer'})
+ ]){
+   assert.throws(()=>durableStartupBatch({store:f.store,adapter:f.adapter,
+     updates:[media,raw('valid','valid text'),bad],accountId,peer}));
+   assert.equal(f.store.list().length,0);
+   assert.deepEqual(f.store.unsupportedInboundCounts(),[]);
+ }
+ f.store.close();
+});
+
+test('always-on refuses unrecognized media types rather than silently skipping',()=>{
+ const f=fixture();
+ for(const type of [3,7,999]){
+  assert.throws(()=>durableStartupBatch({
+   store:f.store,adapter:f.adapter,accountId,peer,
+   updates:[raw('good-image','none',{item_list:[{type:2}]}),
+    raw('unknown-media','none',{item_list:[{type}]}),raw('next-text','important')]
+  }),/ALWAYS_ON_BATCH_UNSAFE/);
+  assert.equal(f.store.list().length,0);
+  assert.deepEqual(f.store.unsupportedInboundCounts(),[]);
+ }
+ f.store.close();
+});
+
+test('always-on startup atomically refuses message-id conflict between old image and text',()=>{
+ const f=fixture(),media=raw('shared','none',{item_list:[{type:2}]});
+ for(const batch of [
+  [media,raw('shared','valid text')],
+  [raw('shared','valid text'),media]
+ ]){
+   assert.throws(()=>durableStartupBatch({store:f.store,adapter:f.adapter,updates:batch,accountId,peer}),
+     /INBOUND_.*_ID_CONFLICT/);
+   assert.equal(f.store.list().length,0);
+   assert.deepEqual(f.store.unsupportedInboundCounts(),[]);
+ }
+ f.store.close();
+});
+
 test('malformed startup batch is rolled back without cursor success or partial archive',()=>{
  const f=fixture();
  assert.throws(()=>durableStartupBatch({

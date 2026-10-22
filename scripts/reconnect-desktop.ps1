@@ -9,7 +9,7 @@ function Report([string]$code,[string]$message,[bool]$warning=$false){
   try{
    $shell=New-Object -ComObject WScript.Shell
    $style=if($warning){48}else{64}
-   [void]$shell.Popup($message,35,'Riven - Weixin reconnect',$style)
+   [void]$shell.Popup($message,35,'LetterFerry - Weixin reconnect',$style)
   }catch{}
  }
 }
@@ -47,13 +47,13 @@ function Status([bool]$requireIdle=$false){
  return [string]$code
 }
 try{
- $initial=Status
+ $initial=Status -requireIdle $true
  if($initial -eq 'ALREADY_CONNECTED'){
-  Report $initial 'Connected. Riven is online; nothing was restarted.'
+  Report $initial 'Connected. LetterFerry is online; nothing was restarted.'
   exit 0
  }
  if($initial -eq 'BROWSER_BUSY_OR_WAITING'){
-  Report $initial 'Bridge is running. The browser is busy or restoring its heartbeat. No restart needed. If this persists, check Edge login and extension v0.2.0.'
+  Report $initial 'Bridge services are running, but the Edge extension heartbeat is not verified. No restart or message replay. Check the exact bound ChatGPT tab, extension receiver version 8 and expected extension manifest v0.4.3; arm only after verifying the tab is idle.'
   exit 0
  }
  if($initial -in @('DISABLED_BY_OWNER','PAUSED_BY_OWNER')){
@@ -94,9 +94,9 @@ try{
    exit 1
   }
   Start-Sleep -Seconds 3
-  $final=Status
+  $final=Status -requireIdle $true
   if($final -eq 'ALREADY_CONNECTED'){
-   Report 'RESTORED' 'Riven is reconnected. Your ordinary Weixin chat can continue.'
+   Report 'RESTORED' 'LetterFerry is reconnected. Your ordinary Weixin chat can continue.'
   }elseif($final -eq 'BROWSER_BUSY_OR_WAITING'){
    Report 'RESTORING_BROWSER' 'The local services are running. Wait about 30 seconds for Edge to reconnect. Check ChatGPT login and extension if needed.'
   }else{
@@ -109,7 +109,7 @@ try{
 }catch{
  Write-Output 'RECONNECT_RESULT SAFE_FAILURE'
  if(-not $Quiet){
-  try{(New-Object -ComObject WScript.Shell).Popup('Reconnect was stopped for safety. Please review the project state; no messages were replayed.',35,'Riven - Reconnect',48)|Out-Null}catch{}
+  try{(New-Object -ComObject WScript.Shell).Popup('Reconnect was stopped for safety. Please review the project state; no messages were replayed.',35,'LetterFerry - Reconnect',48)|Out-Null}catch{}
  }
  exit 1
 }

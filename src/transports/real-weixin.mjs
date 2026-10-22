@@ -3,7 +3,7 @@ import { canonicalDirectChatId, directEnvelopeRejection } from '../policy.mjs';
 
 export const FIXED_BASE_URL = 'https://ilinkai.weixin.qq.com';
 export const PROTOCOL_CLIENT_VERSION = '2.4.10';
-const BOT_AGENT = 'RivenWeixinBridgeLab/0.2.0';
+const BOT_AGENT = 'LetterFerry/0.4.3';
 const LONG_POLL_TIMEOUT_MS = 35_000;
 const SEND_TIMEOUT_MS = 15_000;
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;

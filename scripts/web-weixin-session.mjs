@@ -13,7 +13,7 @@ import {loadEncryptionKey} from '../src/secrets.mjs';
 import {loadSessionBinding,runBoundedSession,enforceBridgeLimit} from './weixin-session.mjs';
 import {hasVerifiedBrowserSmoke} from './verify-web-smoke-history.mjs';
 import {verifyWebHostHealth} from '../src/web-weixin-once-policy.mjs';
-import {START_PREFIX,START_APPROVAL,auditWebSessionStart,selectActivationBatch,archiveActivationBatch,assertPostFenceBatch} from '../src/web-session-policy.mjs';
+import {START_PREFIX,START_APPROVAL,auditWebSessionStart,selectActivationBatch,archiveActivationBatch,partitionPostFenceBatch} from '../src/web-session-policy.mjs';
 import {acquireWebSessionLock} from '../src/web-session-lock.mjs';
 
 const WEB_HEALTH='http://127.0.0.1:8799/health';
@@ -73,13 +73,22 @@ export async function waitForWebHostRecovery({
    }
  }
 }
-export function guardedSessionTransport(real,accountId,peer,healthCheck){
+export function guardedSessionTransport(real,accountId,peer,healthCheck,{store,onQuarantine=()=>{}}={}){
  return {
    async poll(){
      await healthCheck();
      const batch=await real.poll();
-     assertPostFenceBatch(batch,accountId,peer);
-     return batch;
+     const planned=partitionPostFenceBatch(batch,accountId,peer);
+     if(planned.unsupported.length){
+       if(typeof store?.quarantineUnsupportedInbound!=='function')
+         throw Error('UNSUPPORTED_INBOUND_QUARANTINE_REQUIRED');
+       let newlyRecorded=0;
+       for(const record of planned.unsupported){
+         if(store.quarantineUnsupportedInbound(record).newlyRecorded)newlyRecorded++;
+       }
+       onQuarantine({count:planned.unsupported.length,newlyRecorded});
+     }
+     return planned.text;
    },
    commitPoll:()=>real.commitPoll(),
    sendText:(...args)=>real.sendText(...args)
@@ -125,7 +134,9 @@ async function main(){
       },signal:controller.signal,
       onPause:()=>stdout.write('WEB_SESSION_HOST_WAITING no_new_weixin_poll=TRUE no_auto_replay=TRUE\n'),
       onRestore:()=>stdout.write('WEB_SESSION_HOST_RESTORED\n')
-   }));
+   }),{store,onQuarantine:({count,newlyRecorded})=>
+     stdout.write('WEB_SESSION_UNSUPPORTED_QUARANTINED count='+count+
+       ' new='+newlyRecorded+' no_reply=TRUE\n')});
    const bridge=enforceBridgeLimit(new ExistingBridgeClient({
      origin:process.env.CHATGPT_BRIDGE_ORIGIN,
      fetchImpl:(url,options={})=>fetch(url,{...options,signal:AbortSignal.timeout(8000)})
@@ -138,7 +149,11 @@ async function main(){
    // Only move the Weixin cursor AFTER every allowed message in the fence batch
    // has been durably stored as terminal/deferred, never merely discarded.
    await real.commitPoll();
-   stdout.write('START_FENCE_ARCHIVED deferred_new='+archived.deferredNew+' already_safe='+archived.existingSafe+' no_old_messages_sent=TRUE\n');
+   stdout.write('START_FENCE_ARCHIVED deferred_new='+archived.deferredNew+
+     ' already_safe='+archived.existingSafe+
+     ' unsupported_held='+(archived.unsupportedNew||0)+
+     ' unsupported_replayed='+(archived.unsupportedExisting||0)+
+     ' no_old_messages_sent=TRUE\n');
    await ready();
    if(controller.signal.aborted){stdout.write('CANCELLED_AFTER_SAFE_FENCE_NO_WEIXIN_SEND\n');return;}
    stdout.write('SESSION_ACTIVE: from NOW, send normal private messages; no prefix required. AUTO REPLIES ENABLED ONLY FOR THIS SESSION.\n');

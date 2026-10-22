@@ -32,11 +32,45 @@ export class AdapterStore {
         last_error TEXT
       );
       CREATE INDEX IF NOT EXISTS adapter_status ON adapter_events(status,created_ms);`);
+    // A separate minimal reliability schema; no streaming or message-body changes.
+    this.db.exec(`CREATE TABLE IF NOT EXISTS adapter_unsupported_inbound (
+      inbound_key TEXT PRIMARY KEY,
+      account_id TEXT NOT NULL,user_id TEXT NOT NULL,chat_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,kind TEXT NOT NULL
+        CHECK(kind IN ('NON_TEXT_ITEM','MIXED_ITEM_TYPES')),
+      status TEXT NOT NULL DEFAULT 'QUARANTINED_NO_REPLY'
+        CHECK(status='QUARANTINED_NO_REPLY'),
+      created_ms INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS adapter_phase_marks (
+      event_id TEXT NOT NULL,
+      phase TEXT NOT NULL CHECK(phase IN (
+        'INGESTED','BRIDGE_QUEUED','REPLY_READY','OUTBOUND_SENDING',
+        'SUCCEEDED','OUTBOUND_UNKNOWN')),
+      marked_ms INTEGER NOT NULL,
+      PRIMARY KEY(event_id,phase)
+    );
+    CREATE TRIGGER IF NOT EXISTS adapter_phase_ingest
+    AFTER INSERT ON adapter_events
+    BEGIN
+      INSERT OR IGNORE INTO adapter_phase_marks(event_id,phase,marked_ms)
+      VALUES(NEW.id,'INGESTED',NEW.created_ms);
+    END;
+    CREATE TRIGGER IF NOT EXISTS adapter_phase_transition
+    AFTER UPDATE OF status ON adapter_events
+    WHEN NEW.status IN ('BRIDGE_QUEUED','REPLY_READY','OUTBOUND_SENDING',
+      'SUCCEEDED','OUTBOUND_UNKNOWN') AND NEW.status<>OLD.status
+    BEGIN
+      INSERT OR IGNORE INTO adapter_phase_marks(event_id,phase,marked_ms)
+      VALUES(NEW.id,NEW.status,NEW.updated_ms);
+    END;`);
     this.db.prepare("UPDATE adapter_events SET status='OUTBOUND_UNKNOWN',last_error='RECOVERED_AMBIGUOUS_OUTBOUND',updated_ms=? WHERE status='OUTBOUND_SENDING'").run(this.clock());
   }
 
   ingest(update, contextCipher) {
     const inboundKey = `${update.accountId}:${update.messageId}`;
+    if(this.db.prepare('SELECT inbound_key FROM adapter_unsupported_inbound WHERE inbound_key=?').get(inboundKey))
+      throw Error('INBOUND_TEXT_UNSUPPORTED_ID_CONFLICT');
     const id = randomUUID();
     const now = this.clock();
     const outboundClientId = `rwb-${id}`;
@@ -49,6 +83,32 @@ export class AdapterStore {
     return this.get(row.id);
   }
 
+  // Quarantine records only minimal metadata, never image contents or token.
+  quarantineUnsupportedInbound(record){
+    const {accountId,fromUserId,chatId,messageId,kind}=record||{};
+    if(![accountId,fromUserId,chatId,messageId].every(
+       s=>typeof s==='string'&&/^[A-Za-z0-9@._:-]{1,256}$/.test(s))||
+       fromUserId!==chatId||!['NON_TEXT_ITEM','MIXED_ITEM_TYPES'].includes(kind))
+      throw Error('UNSUPPORTED_INBOUND_RECORD_INVALID');
+    const key=accountId+':'+messageId;
+    if(this.getByInboundKey(key))throw Error('UNSUPPORTED_INBOUND_TEXT_ID_CONFLICT');
+    const result=this.db.prepare(`INSERT OR IGNORE INTO adapter_unsupported_inbound
+      (inbound_key,account_id,user_id,chat_id,message_id,kind,status,created_ms)
+      VALUES (?,?,?,?,?,?,'QUARANTINED_NO_REPLY',?)`)
+      .run(key,accountId,fromUserId,chatId,messageId,kind,this.clock());
+    const prior=this.db.prepare(`SELECT account_id,user_id,chat_id,message_id,kind,status
+      FROM adapter_unsupported_inbound WHERE inbound_key=?`).get(key);
+    if(prior.account_id!==accountId||prior.user_id!==fromUserId||
+       prior.chat_id!==chatId||prior.message_id!==messageId||prior.kind!==kind||
+       prior.status!=='QUARANTINED_NO_REPLY')
+      throw Error('UNSUPPORTED_INBOUND_IDEMPOTENCY_CONFLICT');
+    return {newlyRecorded:result.changes===1,status:'QUARANTINED_NO_REPLY'};
+  }
+  unsupportedInboundCounts(){
+    return this.db.prepare(`SELECT kind,COUNT(*) AS count
+      FROM adapter_unsupported_inbound GROUP BY kind ORDER BY kind`).all()
+      .map(row=>({kind:row.kind,count:row.count}));
+  }
   get(id, includePrivate = false) {
     return this.db.prepare(`SELECT ${includePrivate ? '*' : PUBLIC_COLUMNS} FROM adapter_events WHERE id=?`).get(id);
   }

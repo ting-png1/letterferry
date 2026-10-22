@@ -24,7 +24,7 @@ Primary sources:
 
 ## Headers and URL boundary
 
-Bot POSTs carry `Content-Type: application/json`, `AuthorizationType: ilink_bot_token`, `Authorization: Bearer <token>`, random uint32 decimal text encoded as base64 in `X-WECHAT-UIN`, `iLink-App-Id: bot`, and version 2.4.10 packed as `0x00MMNNPP`. `base_info` declares protocol channel version 2.4.10 and `RivenWeixinBridgeLab/0.2.0` as the observational bot agent. QR status GETs carry only the documented app headers.
+Bot POSTs carry `Content-Type: application/json`, `AuthorizationType: ilink_bot_token`, `Authorization: Bearer <token>`, random uint32 decimal text encoded as base64 in `X-WECHAT-UIN`, `iLink-App-Id: bot`, and version 2.4.10 packed as `0x00MMNNPP`. `base_info` declares protocol channel version 2.4.10 and `LetterFerry/0.4.3` as the observational bot agent. QR status GETs carry only the documented app headers.
 
 Fetch redirects are rejected. Initial QR traffic uses the fixed origin. Returned API base URLs and `scaned_but_redirect` hosts must be HTTPS, have no credentials/port/path/query/fragment, and be either the fixed host or a subdomain of `weixin.qq.com`. This narrow allowlist may reject a legitimate future Tencent host; that is an intentional fail-closed limitation pending public evidence.
 

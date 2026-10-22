@@ -33,11 +33,14 @@ function validChatUrl(value) {
       && !url.hash && /^(?:\/c\/|\/g\/[^/]+\/c\/)[0-9a-f-]{36}\/?$/i.test(url.pathname);
   } catch {return false;}
 }
+// Edge MV3 alarms run at roughly 30s intervals; 25s would expire between
+// healthy checks. Keep a bounded grace, never bypass exact tab ownership.
+export const HOST_HEARTBEAT_TTL_MS=75_000;
 export function createWebHostServer({store,key,now=()=>Date.now(),host='127.0.0.1',port=8799,autoState=()=>({enabled:false})}) {
   if (!store || !/^[a-f0-9]{64}$/.test(key)) throw new Error('WEB_HOST_CONFIGURATION_INVALID');
   if (host!=='127.0.0.1') throw new Error('WEB_HOST_LOOPBACK_ONLY');
   let currentHost=null;
-  function alive() {return currentHost && now()-currentHost.lastSeen<25_000;}
+  function alive() {return currentHost && now()-currentHost.lastSeen<HOST_HEARTBEAT_TTL_MS;}
   function hostState() { return alive() ? 'HOST_READY' : 'HOST_UNVERIFIED'; }
   const server=http.createServer(async (req,res)=>{
     try {
@@ -47,7 +50,7 @@ export function createWebHostServer({store,key,now=()=>Date.now(),host='127.0.0.
       if(/^chrome-extension:\/\/[a-p]{32}$/.test(origin)) {
         res.setHeader('access-control-allow-origin',origin);
         res.setHeader('vary','Origin');
-        res.setHeader('access-control-allow-headers','authorization, content-type');
+        res.setHeader('access-control-allow-headers','authorization, content-type, x-bridge-tab-id, x-bridge-url');
         res.setHeader('access-control-allow-methods','POST, OPTIONS');
         if(req.method==='OPTIONS' && url.pathname.startsWith('/extension/')){res.writeHead(204);return res.end();}
       }
@@ -57,6 +60,20 @@ export function createWebHostServer({store,key,now=()=>Date.now(),host='127.0.0.
         if(expected.length!==provided.length || !timingSafeEqual(expected,provided)) return json(res,404,{error:'NOT_FOUND'});
       }
       if(!isBridge && !url.pathname.startsWith('/extension/')) return json(res,404,{error:'NOT_FOUND'});
+      if(url.pathname==='/extension/owner-status' && req.method==='GET'){
+        const rawId=req.headers['x-bridge-tab-id'];
+        const rawUrl=req.headers['x-bridge-url'];
+        const tabId=typeof rawId==='string'&&/^[1-9][0-9]{0,12}$/.test(rawId)?Number(rawId):null;
+        if(!Number.isSafeInteger(tabId)||typeof rawUrl!=='string'||!validChatUrl(rawUrl))
+          throw Error('INVALID_HOST_OWNER_QUERY');
+        // Authenticated read-only proof; never returns the pinned URL, tab ID or task content.
+        return json(res,200,{
+          host:hostState(),
+          ownerMatches:Boolean(alive()&&currentHost.tabId===tabId&&currentHost.url===rawUrl),
+          pendingBrowserDelivery:Boolean(store.counts().ASSIGNED_UNKNOWN||
+            store.counts().BROWSER_SUBMITTED||store.counts().DELIVERY_UNKNOWN)
+        });
+      }
       if(url.pathname==='/extension/auto-state' && req.method==='POST'){
         const state=autoState();
         return json(res,200,{enabled:state?.enabled===true,chatUrl:state?.enabled===true?state.chatUrl:null});

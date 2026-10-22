@@ -2,7 +2,7 @@
 setlocal
 cd /d "%~dp0"
 echo ===================================================
-echo Riven Web Weixin - 30-minute live chat (20 max DMs)
+echo LetterFerry Web Weixin - 30-minute live chat (20 max DMs)
 echo ===================================================
 echo This mode automatically sends Weixin replies after ONE explicit session approval.
 echo It archives all older same-peer DMs from the activation batch without replying.

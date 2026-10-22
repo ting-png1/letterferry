@@ -60,7 +60,7 @@ export function normalizeInbound(raw, accountId) {
   const textItems = Array.isArray(raw.item_list)
     ? raw.item_list.filter((item) => item?.type === 1 && typeof item?.text_item?.text === 'string')
     : [];
-  if (textItems.length !== 1) throw new Error('EXACTLY_ONE_TEXT_ITEM_REQUIRED');
+  if (textItems.length !== 1 || raw.item_list.length !== 1) throw new Error('EXACTLY_ONE_TEXT_ITEM_REQUIRED');
   const text = textItems[0].text_item.text.trim();
   if (!text || text.length > 2000) throw new Error('INVALID_TEXT');
   if (typeof raw.context_token !== 'string' || !raw.context_token) throw new Error('CONTEXT_TOKEN_REQUIRED');

@@ -5,7 +5,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {randomUUID} from 'node:crypto';
 import {WebHostStore} from '../src/web-host-store.mjs';
-import {createWebHostServer} from '../src/web-host-server.mjs';
+import {createWebHostServer,HOST_HEARTBEAT_TTL_MS} from '../src/web-host-server.mjs';
 import {ExistingBridgeClient} from '../src/bridge-client.mjs';
 
 const key='a'.repeat(64), url='https://chatgpt.com/c/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', peer={tabId:77,url};
@@ -101,6 +101,59 @@ test('explicit stop revokes Host readiness but refuses to erase unresolved brows
  }finally{await f.close();}
 });
 
+test('30-second Edge alarm cadence remains HOST_READY while missed heartbeats expire safely',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'rwb-lease-'));
+ const store=new WebHostStore(join(dir,'test.sqlite'));
+ let ms=0;
+ const service=createWebHostServer({store,key,port:0,now:()=>ms});
+ try{
+  const address=await service.start(),origin='http://127.0.0.1:'+address.port;
+  const heartbeat=()=>fetch(origin+'/extension/heartbeat',{method:'POST',
+   headers:{authorization:'Bearer '+key,'content-type':'application/json'},
+   body:JSON.stringify({...peer,ready:true})});
+  const health=async()=> (await (await fetch(origin+'/health')).json()).host;
+  assert.equal(HOST_HEARTBEAT_TTL_MS,75_000);
+  assert.equal((await heartbeat()).status,200);
+  ms=30_000;assert.equal(await health(),'HOST_READY');
+  ms=61_000;assert.equal(await health(),'HOST_READY');
+  ms=75_000;assert.equal(await health(),'HOST_UNVERIFIED');
+  // A fresh exact owner heartbeat restores readiness; owner takeover stays protected.
+  assert.equal((await heartbeat()).status,200);
+  ms=105_000;assert.equal(await health(),'HOST_READY');
+  ms=151_000;assert.equal(await health(),'HOST_UNVERIFIED');
+ }finally{await service.stop();store.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('authenticated owner proof is exact, read-only and does not expose IDs or URL',async()=>{
+ const f=await fixture();
+ const owner=async(tabId,location=url,authorized=true)=>{
+  const response=await fetch(f.origin+'/extension/owner-status',{
+   method:'GET',headers:{...(authorized?{authorization:'Bearer '+key}:{}),
+    'x-bridge-tab-id':String(tabId),'x-bridge-url':location}});
+  return {status:response.status,body:await response.json()};
+ };
+ try{
+  let proof=await owner(peer.tabId);
+  assert.equal(proof.status,200);assert.equal(proof.body.ownerMatches,false);
+  assert.equal((await owner(peer.tabId,url,false)).status,404);
+  await f.request('/extension/heartbeat',{...peer,ready:true});
+  proof=await owner(peer.tabId);
+  assert.equal(proof.body.ownerMatches,true);
+  assert.equal(proof.body.pendingBrowserDelivery,false);
+  assert.equal((await owner(999)).body.ownerMatches,false);
+  assert.equal((await owner(peer.tabId,'https://chatgpt.com/c/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb')).body.ownerMatches,false);
+  assert.equal((await owner('INVALID')).status,409);
+  const e=await f.bridge.enqueue(msg());
+  assert.equal((await f.request('/extension/poll',peer)).body.event.id,e.eventId);
+  proof=await owner(peer.tabId);
+  assert.equal(proof.body.pendingBrowserDelivery,true);
+  const serialized=JSON.stringify(proof);
+  assert.equal(serialized.includes(url),false);
+  assert.equal(serialized.includes('tabId'),false);
+  assert.equal(serialized.includes(e.eventId),false);
+ }finally{await f.close();}
+});
+
 test('a slow model reply remains collectible after heartbeat expiry without allowing tab takeover',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'rwb-slow-host-'));
  const store=new WebHostStore(join(dir,'test.sqlite'));
@@ -116,7 +169,7 @@ test('a slow model reply remains collectible after heartbeat expiry without allo
   const e=await bridge.enqueue(msg());
   assert.equal((await api('/extension/heartbeat',{...peer,ready:true})).status,200);
   assert.equal((await api('/extension/poll',peer)).body.event.id,e.eventId);
-  ms=30_000; // Heartbeat expired while the ChatGPT browser was generating.
+  ms=HOST_HEARTBEAT_TTL_MS+5_000; // Heartbeat expired while the ChatGPT browser was generating.
   assert.equal((await (await fetch(root+'/health')).json()).host,'HOST_UNVERIFIED');
   assert.equal((await api('/extension/heartbeat',{tabId:999,url,ready:true})).status,409);
   assert.equal((await api('/extension/submitted',{...peer,id:e.eventId})).status,200);

@@ -1,6 +1,8 @@
 import {readFileSync,writeFileSync,renameSync,mkdirSync} from 'node:fs';
 import {randomUUID} from 'node:crypto';
 import {dirname,resolve} from 'node:path';
+import {partitionPostFenceBatch} from './web-session-policy.mjs';
+import {getInboundMessageId} from './policy.mjs';
 export const AUTO_FILE=resolve('data/always-on.json');
 const UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export const AUTO_VERSION=1;
@@ -53,16 +55,30 @@ export function classifyRecovery(rows){
 }
 export function durableStartupBatch({store,adapter,updates,accountId,peer}){
  if(!Array.isArray(updates))throw Error('ALWAYS_ON_INVALID_BATCH');
- let newlyDeferred=0,alreadyStored=0;
+ if(typeof adapter?.policy?.authorize!=='function'||!store?.db)
+   throw Error('ALWAYS_ON_POLICY_MISSING');
+ let plan;
+ try{plan=partitionPostFenceBatch(updates,accountId,peer);}
+ catch{throw Error('ALWAYS_ON_BATCH_UNSAFE');}
+ if(plan.unsupported.length&&typeof store.quarantineUnsupportedInbound!=='function')
+   throw Error('ALWAYS_ON_UNSUPPORTED_QUARANTINE_REQUIRED');
+ const media=new Map(plan.unsupported.map(record=>[accountId+':'+record.messageId,record]));
+ let newlyDeferred=0,alreadyStored=0,unsupportedNew=0,unsupportedExisting=0;
+ // This entire boot fence is one durable unit. The caller commits the Weixin
+ // cursor only after this transaction succeeds; no old item can trigger a reply.
  store.db.exec('BEGIN IMMEDIATE');
  try{
   for(const raw of updates){
-    // A skipped malformed allowed DM could be permanently lost after cursor commit.
-    // Require a complete normalized DM before staging any part of the batch.
-    if(raw?.from_user_id!==peer.userId)throw Error('ALWAYS_ON_UNEXPECTED_PEER');
-    const normalized=adapter.policy?.authorize;
-    if(typeof normalized!=='function')throw Error('ALWAYS_ON_POLICY_MISSING');
-    // ingestRaw rejects malformed envelopes; treat rejection as transaction failure.
+    const isPureText=raw.item_list.length===1&&raw.item_list[0].type===1;
+    if(!isPureText){
+      const key=accountId+':'+getInboundMessageId(raw);
+      const record=media.get(key);
+      if(!record)throw Error('ALWAYS_ON_UNCLASSIFIED_MEDIA');
+      const held=store.quarantineUnsupportedInbound(record);
+      if(held.newlyRecorded)unsupportedNew++;
+      else unsupportedExisting++;
+      continue;
+    }
     const accepted=adapter.ingestRaw(raw);
     if(!accepted.accepted||!accepted.event)throw Error('ALWAYS_ON_BATCH_UNSAFE');
     if(accepted.event.account_id!==accountId||accepted.event.user_id!==peer.userId||
@@ -75,5 +91,7 @@ export function durableStartupBatch({store,adapter,updates,accountId,peer}){
   }
   store.db.exec('COMMIT');
  }catch(error){store.db.exec('ROLLBACK');throw error;}
- return {newlyDeferred,alreadyStored,total:updates.length};
+ const result={newlyDeferred,alreadyStored,total:updates.length};
+ if(plan.unsupported.length)Object.assign(result,{unsupportedNew,unsupportedExisting});
+ return result;
 }

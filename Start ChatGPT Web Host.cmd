@@ -2,7 +2,7 @@
 setlocal
 cd /d "%~dp0"
 echo.
-echo Riven ChatGPT Web Host - local manual mode
+echo LetterFerry ChatGPT Web Host - local manual mode
 echo Does NOT start Weixin polling or send messages on its own.
 echo The user must bind and arm one ChatGPT tab in Edge separately.
 echo Close this console or press Ctrl+C to stop.

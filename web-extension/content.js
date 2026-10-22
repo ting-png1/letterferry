@@ -91,13 +91,13 @@ function newOrChanged(node,role,before) {
   return turnText(node,role)!==prior.text;
 }
 function structureSurvey(boundUrl) {
-  if(location.href!==boundUrl) return {receiverVersion:7,ready:false,reason:'BOUND_TAB_CHANGED'};
+  if(location.href!==boundUrl) return {receiverVersion:8,ready:false,reason:'BOUND_TAB_CHANGED'};
   // Read-only structural counts; not a single character of user/model text leaves the tab.
   const count=selector=>document.querySelectorAll(selector).length;
   const assistants=turns('assistant'),lastAssistant=assistants[assistants.length-1];
   const bodyCandidates=[...(lastAssistant?.querySelectorAll?.(assistantBodySelector)||[])];
   return {
-    receiverVersion:7,ready:true,
+    receiverVersion:8,ready:true,
     classicAssistant:count('[data-message-author-role="assistant"]'),
     groupedAssistant:count('[data-content-search-unit-key$=":assistant"]'),
     groupedUser:count('[data-content-search-unit-key$=":user"]'),
@@ -107,7 +107,10 @@ function structureSurvey(boundUrl) {
     lastAssistantFallbackBlocks:lastAssistant?meaningfulBlocks(lastAssistant,assistantBlockSelector).length:0,
     lastAssistantRecognizedBody:lastAssistant?Number(Boolean(turnText(lastAssistant,'assistant'))):0,
     lastAssistantLabelOnly:lastAssistant?Number(isSpeakerChrome(textOf(lastAssistant))):0,
-    assistantsWithBody:assistants.filter(node=>Boolean(turnText(node,'assistant'))).length,
+    // The survey must not rescan a huge historical conversation synchronously.
+    // Count a bounded tail; delivery extraction itself is unchanged.
+    assistantBodySampled:Math.min(assistants.length,24),
+    assistantsWithBody:assistants.slice(-24).filter(node=>Boolean(turnText(node,'assistant'))).length,
     lastAssistantDescendants:lastAssistant?.querySelectorAll?.('*')?.length||0,
     lastAssistantBlockElements:lastAssistant?.querySelectorAll?.('p, pre, blockquote, li, [role="paragraph"]')?.length||0,
     lastAssistantParentBodyNodes:lastAssistant?.parentElement?.querySelectorAll?.(assistantBodySelector)?.length||0
@@ -173,7 +176,10 @@ function sendCandidate(input) {
     const candidates=[...scope.querySelectorAll('button')].filter(matches);
     // Fail closed rather than choose randomly if multiple send-like buttons exist.
     if(candidates.length===1)return candidates[0];
-    return null;
+    // Multiple matching controls are ambiguous; never pick one arbitrarily.
+    // If the scoped composer has no candidate, check only the explicit
+    // semantic global selectors below (portalled Send button layout).
+    if(candidates.length>1)return null;
   }
   // A few ChatGPT layouts use a portalled button outside the containing form.
   const selectors=[
@@ -201,7 +207,17 @@ async function waitForSend(input) {
   }
   throw Error(sawButton?'SEND_BUTTON_DISABLED':'SEND_BUTTON_NOT_FOUND');
 }
-function stopping(){return !!document.querySelector('button[data-testid="stop-button"], button[aria-label="Stop generating"]');}
+const stopSelector='button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="停止"], button[aria-label="停止生成"], button[aria-label="Stop"]';
+function stopping(){
+  // Multiple ChatGPT conversations may coexist in floating panels. A stop
+  // button outside the actual bound composer must not block this conversation.
+  const input=editor();
+  const scope=input?.closest?.('form, [data-testid="composer"]');
+  // The fallback is deliberately fail-closed when no reliable composer exists:
+  // a layout change must never falsely declare a generating page idle.
+  if(!scope)return Boolean(document.querySelector(stopSelector));
+  return Boolean(scope.querySelector?.(stopSelector));
+}
 // Rich-text composers can render a line break as two DOM blocks. In that
 // layout, textContent concatenates the two lines without a newline even though
 // innerText and the visible draft contain the complete message.
@@ -220,6 +236,18 @@ function editorConfirmed(input,text){
     ? [input.value]
     : [input.innerText,input.textContent];
   return rendered.some(value=>sameExceptLineBreaks(text,value));
+}
+async function waitForEditorConfirmation(input,text,boundUrl){
+  // Rich ChatGPT composers can settle asynchronously after insertText/input.
+  // Observe the SAME verified editor, never paste twice or submit a partial draft.
+  const deadline=Date.now()+3500;
+  while(true){
+    if(location.href!==boundUrl || stopping() || editor()!==input)
+      throw Error('PAGE_NOT_READY');
+    if(editorConfirmed(input,text))return;
+    if(Date.now()>=deadline)throw Error('INPUT_NOT_CONFIRMED');
+    await pause(150);
+  }
 }
 function userTurnContains(node,text){
   const rendered=turnText(node,'user');
@@ -240,10 +268,26 @@ async function submit(id,text,boundUrl){
   if(input.tagName==='TEXTAREA'){
     const setter=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(input),'value')?.set;
     if(setter) setter.call(input,text); else input.value=text;
-  }else if(!document.execCommand('insertText',false,text))throw Error('INPUT_NOT_ACCEPTED');
+  }else{
+    // Background tabs may retain their selection in a floating conversation.
+    // Anchor the caret INSIDE the exact editor before inserting text.
+    try{
+      const selection=globalThis.getSelection?.();
+      const range=document.createRange?.();
+      if(!selection||!range)throw Error('NO_EDITOR_SELECTION');
+      range.selectNodeContents(input);
+      range.collapse(false);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      if(selection.rangeCount<1 || !input.contains(selection.anchorNode))
+        throw Error('EDITOR_CARET_NOT_INSIDE_INPUT');
+    }catch{
+      throw Error('INPUT_NOT_CONFIRMED');
+    }
+    if(!document.execCommand('insertText',false,text))throw Error('INPUT_NOT_ACCEPTED');
+  }
   input.dispatchEvent(new Event('input',{bubbles:true}));
-  await pause(250);
-  if(!editorConfirmed(input,text))throw Error('INPUT_NOT_CONFIRMED');
+  await waitForEditorConfirmation(input,text,boundUrl);
   // ChatGPT often renders/enables the send button asynchronously after an editor update.
   const button=await waitForSend(input);
   if(location.href!==boundUrl||stopping()||!editorConfirmed(input,text))throw Error('PAGE_NOT_READY');
@@ -263,10 +307,12 @@ async function submit(id,text,boundUrl){
       const responses=turns('assistant').filter(node=>newOrChanged(node,'assistant',beforeAssistant));
       if(responses.length){
         hasNew=true;
-        const message=responses[responses.length-1];
-        const value=turnText(message,'assistant');
+        // A single Weixin prompt can produce several assistant turns when ChatGPT
+        // interleaves tool work or staged final messages. Preserve every new
+        // assistant body in order, never only the newest visible bubble.
+        const value=responses.map(message=>turnText(message,'assistant')).filter(Boolean).join('\n\n');
         if(value!==last){last=value;stableAt=Date.now();}
-        if(value && value.length<=2000 && !stopping() && Date.now()-stableAt>=4500)return value;
+        if(value && value.length<=2000 && !stopping() && Date.now()-stableAt>=7500)return value;
         if(value.length>2000)throw Error('REPLY_TOO_LONG');
       }
     }
@@ -275,7 +321,7 @@ async function submit(id,text,boundUrl){
   throw Error(!submittedUserSeen?'SUBMITTED_USER_TURN_NOT_FOUND':hasNew&&!last?'ASSISTANT_BODY_NOT_FOUND':hasNew?'REPLY_COMPLETION_UNVERIFIED':'ASSISTANT_TURN_NOT_FOUND');
 }
 chrome.runtime.onMessage.addListener((msg,_sender,respond)=>{
-  if(msg.action==='preflight'){respond({receiverVersion:7,...diagnose(msg.boundUrl)});return false;}
+  if(msg.action==='preflight'){respond({receiverVersion:8,...diagnose(msg.boundUrl)});return false;}
   if(msg.action==='survey'){respond(structureSurvey(msg.boundUrl));return false;}
   if(msg.action==='start-delivery'){
     if(occupied){respond({accepted:false,error:'PAGE_BUSY'});return false;}

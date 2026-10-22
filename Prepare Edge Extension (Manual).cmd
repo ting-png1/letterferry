@@ -9,12 +9,12 @@ if not exist "%EdgeExe%" (
   exit /b 1
 )
 if not exist "%~dp0web-extension\manifest.json" (
-  echo [ERROR] The Riven extension folder is missing.
+  echo [ERROR] The LetterFerry extension folder is missing.
   pause
   exit /b 1
 )
 echo.
-echo Riven - Step 1 of 2: Open Edge extensions management.
+echo LetterFerry - Step 1 of 2: Open Edge extensions management.
 echo The Edge internal page cannot reliably be opened via a command-line URL.
 powershell.exe -NoProfile -Command "Set-Clipboard -Value 'edge://extensions/'"
 if errorlevel 1 (
@@ -31,7 +31,7 @@ echo.
 echo AFTER THE EXTENSIONS PAGE IS OPEN, come back to this window.
 pause
 echo.
-echo Riven - Step 2 of 2: Load the local extension folder.
+echo LetterFerry - Step 2 of 2: Load the local extension folder.
 powershell.exe -NoProfile -Command "Set-Clipboard -Value (Join-Path (Get-Location).Path 'web-extension')"
 if errorlevel 1 (
   echo [ERROR] Could not copy the extension folder path.

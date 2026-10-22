@@ -16,7 +16,7 @@ $shortcut=$shell.CreateShortcut($target)
 $shortcut.TargetPath=(Get-Command powershell.exe).Source
 $shortcut.Arguments='-NoLogo -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "'+$boot+'"'
 $shortcut.WorkingDirectory=$root
-$shortcut.Description='Riven Weixin - paired ChatGPT browser bridge, after Windows login'
+$shortcut.Description='LetterFerry - paired ChatGPT browser bridge, after Windows login'
 $shortcut.WindowStyle=7
 $shortcut.Save()
 if(-not(Test-Path -LiteralPath $target -PathType Leaf)){throw 'WINDOWS_STARTUP_SHORTCUT_NOT_CREATED'}
@@ -24,4 +24,4 @@ if(-not(Test-Path -LiteralPath $target -PathType Leaf)){throw 'WINDOWS_STARTUP_S
 if($LASTEXITCODE -ne 0){throw 'ALWAYS_ON_STATE_NOT_SAVED'}
 'STARTUP_SHORTCUT_VERIFIED=TRUE'
 'WINDOWS_LOGIN_AUTOSTART_CONFIGURED=TRUE'
-'THIS_REQUIRES_EDGE_EXTENSION_V0_2_0_RELOADED_ONCE=TRUE'
+'THIS_REQUIRES_EDGE_EXTENSION_V0_4_3_RELOADED_ONCE=TRUE'

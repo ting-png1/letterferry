@@ -11,16 +11,27 @@ function failureCode(error){
   if(/Receiving end does not exist/i.test(message))return 'BROWSER_RECEIVER_MISSING';
   return browserFailureCodes.has(message)?message:'BROWSER_MESSAGE_REJECTED';
 }
-const runtime=async()=>await chrome.storage.session.get(['armed','boundTabId','boundUrl','lastFailure','activeEventId']);
+const runtime=async()=>await chrome.storage.session.get(['armed','boundTabId','boundUrl','lastFailure','activeEventId','autoManaged']);
 const config=async()=>await chrome.storage.local.get(['localBridgeKey']);
 function validUrl(url) {try{const u=new URL(url);return u.protocol==='https:'&&u.hostname==='chatgpt.com'&&!u.username&&!u.password&&!u.hash&&/^(?:\/c\/|\/g\/[^/]+\/c\/)[0-9a-f-]{36}\/?$/i.test(u.pathname);}catch{return false;}}
-async function request(path,data) {
+async function request(path,data,timeoutMs=15000) {
   const {localBridgeKey}=await config();
   if(!/^[a-f0-9]{64}$/.test(localBridgeKey||'')) throw Error('LOCAL_KEY_MISSING');
-  const response=await fetch(ROOT+path,{method:'POST',headers:{'content-type':'application/json','authorization':'Bearer '+localBridgeKey},body:JSON.stringify(data),signal:AbortSignal.timeout(15000)});
+  const response=await fetch(ROOT+path,{method:'POST',headers:{'content-type':'application/json','authorization':'Bearer '+localBridgeKey},body:JSON.stringify(data),signal:AbortSignal.timeout(timeoutMs)});
   const result=await response.json();
   if(!response.ok) throw Error(result.error||'LOCAL_BRIDGE_UNAVAILABLE');
   return result;
+}
+async function receiverPreflight(tabId,boundUrl){
+  let timer;
+  try{
+    return await Promise.race([
+      chrome.tabs.sendMessage(tabId,{action:'preflight',boundUrl}),
+      new Promise((_,reject)=>{
+        timer=setTimeout(()=>reject(Error('RECEIVER_PREFLIGHT_TIMEOUT')),4000);
+      })
+    ]);
+  }finally{if(timer!==undefined)clearTimeout(timer);}
 }
 async function preflight(tabId,boundUrl) {
   if(!validUrl(boundUrl)) throw Error('INVALID_CHATGPT_TAB');
@@ -28,7 +39,7 @@ async function preflight(tabId,boundUrl) {
   if(tab.url!==boundUrl) throw Error('BOUND_TAB_CHANGED');
   let answer;
   try {
-    answer=await chrome.tabs.sendMessage(tabId,{action:'preflight',boundUrl});
+    answer=await receiverPreflight(tabId,boundUrl);
   } catch(error) {
     // Existing ChatGPT tabs often predate extension installation; content.js was not injected.
     if(!/Receiving end does not exist/i.test(error?.message||'')) throw error;
@@ -36,12 +47,12 @@ async function preflight(tabId,boundUrl) {
     if(stillSameTab.url!==boundUrl) throw Error('BOUND_TAB_CHANGED');
     try {
       await chrome.scripting.executeScript({target:{tabId,allFrames:false},files:['content.js']});
-      answer=await chrome.tabs.sendMessage(tabId,{action:'preflight',boundUrl});
+      answer=await receiverPreflight(tabId,boundUrl);
     } catch {
       throw Error('CHATGPT_SCRIPT_UNAVAILABLE_RELOAD_TAB');
     }
   }
-  if(answer?.receiverVersion!==7) throw Error('RECEIVER_STALE_REFRESH_TAB');
+  if(answer?.receiverVersion!==8) throw Error('RECEIVER_STALE_REFRESH_TAB');
   if(!answer.ready){
     const reason=answer?.reason||'UNKNOWN';
     if(reason==='EDITOR_NOT_FOUND') throw Error('EDITOR_NOT_FOUND (editable='+Number(answer.editableCount||0)+', textarea='+Number(answer.textareaCount||0)+', promptId='+Boolean(answer.promptIdFound)+')');
@@ -145,7 +156,33 @@ async function autoMaintain(){
      }
      return;
    }
-   if(state.armed){if(state.autoManaged)tick().catch(()=>{});return;}
+   if(state.armed){
+     // Auto-bound tabs can be closed or navigated while MV3 session state
+     // still says armed. Revoke false readiness, but never interrupt an active
+     // or possibly-submitted browser delivery.
+     if(state.autoManaged && !state.activeEventId && !inFlight && !currentEvent){
+       let currentTab;
+       try{currentTab=await chrome.tabs.get(state.boundTabId);}catch{}
+       let preflightOk=Boolean(currentTab&&currentTab.url===state.boundUrl&&
+         state.boundUrl===desired.chatUrl);
+       if(preflightOk){try{await preflight(state.boundTabId,state.boundUrl);}
+         catch{preflightOk=false;}}
+       if(!preflightOk){
+         const latest=await runtime();
+         if(latest.autoManaged && latest.armed && !latest.activeEventId &&
+            !inFlight && !currentEvent && latest.boundTabId===state.boundTabId &&
+            latest.boundUrl===state.boundUrl){
+           await chrome.storage.session.set({armed:false,autoManaged:false,
+             boundTabId:null,boundUrl:null});
+           try{await request('/extension/disarm',{
+             tabId:state.boundTabId,url:state.boundUrl});}catch{}
+         }
+         return;
+       }
+     }
+     if(state.autoManaged)tick().catch(()=>{});
+     return;
+   }
    if(inFlight || currentEvent || state.activeEventId)return;
    // Restore only the URL pinned by the locally authorized always-on config;
    // never select a different ChatGPT conversation by browser tab order.
@@ -194,7 +231,7 @@ chrome.runtime.onMessage.addListener((m,sender,respond)=>{
         if(['CHATGPT_SCRIPT_UNAVAILABLE_RELOAD_TAB','RECEIVER_STALE_REFRESH_TAB'].includes(code)) return {message:'当前 ChatGPT 标签页的接收脚本需要刷新。请按 Ctrl+R，等页面加载后重新绑定。'};
         if(code==='ASSISTANT_GENERATING') return {message:'ChatGPT 还在生成回复，等结束后再点绑定。'};
         if(code==='PAGE_BUSY') return {message:'这个聊天窗口正在处理其他任务，稍后再试。'};
-        if(code.startsWith('EDITOR_NOT_FOUND')) return {message:'页面已连接，但没找到可用的 ChatGPT 输入框。只读结构诊断：'+code+'。请把这行发给 Riven 排查。'};
+        if(code.startsWith('EDITOR_NOT_FOUND')) return {message:'页面已连接，但没找到可用的 ChatGPT 输入框。只读结构诊断：'+code+'。请把这行发给 LetterFerry 维护者排查。'};
         return {message:'绑定前检查失败：'+code};
       }
       await chrome.storage.session.set({armed:false,boundTabId:tab.id,boundUrl:tab.url});
@@ -203,13 +240,26 @@ chrome.runtime.onMessage.addListener((m,sender,respond)=>{
     if(m.command==='arm'){
       const old=await runtime();
       if(!old.boundTabId)return {message:'请先绑定标签页'};
+      if(inFlight||currentEvent||old.activeEventId)
+        return {message:'已有任务可能正在处理，未改变监听状态；请等待任务确认，不要重发。'};
+      if(!validUrl(old.boundUrl))
+        return {message:'原绑定窗口无效，未改变监听状态。'};
+      try{
+        // First validate the same bound tab and local Host. Do not set armed
+        // until both checks finish; a hung receiver cannot imply readiness.
+        await preflight(old.boundTabId,old.boundUrl);
+        await request('/extension/heartbeat',
+          {tabId:old.boundTabId,url:old.boundUrl,ready:true},4500);
+      }catch(e){
+        const code=e?.message==='RECEIVER_PREFLIGHT_TIMEOUT'?'页面接收脚本超时（4 秒），没有确认连接。'
+          :e?.name==='TimeoutError'?'本地 Host 心跳超时，未启动新监听。'
+          :'启动失败：'+(e?.message||'UNKNOWN');
+        return {message:code+'未发送微信消息。'};
+      }
       await chrome.storage.local.set({manualAutoPause:false});
       await chrome.storage.session.set({armed:true,autoManaged:false});
-      try{
-        const who=await target();
-        await request('/extension/heartbeat',{...who,ready:true});
-      }catch(e){await chrome.storage.session.set({armed:false});return {message:'启动失败：'+e.message};}
-      tick().catch(()=>{});return {message:'网页标签页和本地 Host 均已连接；模型回复和微信送达仍待验证'};
+      tick().catch(()=>{});
+      return {message:'网页标签页和本地 Host 均已连接；模型回复和微信送达仍待验证'};
     }
     if(m.command==='stop'){
       await chrome.storage.local.set({manualAutoPause:true});
@@ -227,10 +277,20 @@ chrome.runtime.onMessage.addListener((m,sender,respond)=>{
       if(!s.boundTabId||!validUrl(s.boundUrl))return {message:'先绑定指定 ChatGPT 对话，再做只读结构检查'};
       const tab=await chrome.tabs.get(s.boundTabId);
       if(tab.url!==s.boundUrl)return {message:'已绑定的聊天窗口已变化，请重新绑定'};
-      let survey;
-      try{survey=await chrome.tabs.sendMessage(s.boundTabId,{action:'survey',boundUrl:s.boundUrl});}
-      catch{return {message:'页面接收脚本没有响应。请刷新 ChatGPT 标签页，再重新绑定。'};}
-      if(survey?.receiverVersion!==7||!survey.ready)return {message:'接收脚本需要刷新，或绑定窗口发生了变化'};
+      let survey,timer;
+      try{
+        survey=await Promise.race([
+          chrome.tabs.sendMessage(s.boundTabId,{action:'survey',boundUrl:s.boundUrl}),
+          new Promise((_,reject)=>{
+            timer=setTimeout(()=>reject(Error('SURVEY_TIMEOUT')),4500);
+          })
+        ]);
+      }catch(error){
+        return {message:error?.message==='SURVEY_TIMEOUT'
+          ?'检查超时：页面接收脚本未在 4.5 秒内回复。没有更改监听或发送消息。'
+          :'页面接收脚本没有响应。请先检查已绑定的 ChatGPT 页面，暂勿重启或重发。'};
+      }finally{if(timer!==undefined)clearTimeout(timer);}
+      if(survey?.receiverVersion!==8||!survey.ready)return {message:'接收脚本需要刷新，或绑定窗口发生了变化'};
       const safeNumber=name=>Number.isSafeInteger(survey[name])&&survey[name]>=0&&survey[name]<100_000?survey[name]:'?';
       return {message:'只读页面结构诊断（不包含聊天文字）：\n旧版助手标记：'+safeNumber('classicAssistant')+
         '\n新版助手标记：'+safeNumber('groupedAssistant')+
@@ -241,15 +301,85 @@ chrome.runtime.onMessage.addListener((m,sender,respond)=>{
         '\n最新助手可用段落／代码块：'+safeNumber('lastAssistantFallbackBlocks')+
         '\n最新助手正文可提取：'+safeNumber('lastAssistantRecognizedBody')+
         '\n最新助手仅有说话者标签：'+safeNumber('lastAssistantLabelOnly')+
-        '\n助手消息中可提取正文的数量：'+safeNumber('assistantsWithBody')+
+        '\n最近抽样助手消息数：'+safeNumber('assistantBodySampled')+
+        '\n抽样中可提取正文的数量：'+safeNumber('assistantsWithBody')+
         '\n最新助手内部元素数：'+safeNumber('lastAssistantDescendants')+
         '\n最新助手段落／块元素数：'+safeNumber('lastAssistantBlockElements')+
         '\n最新助手父容器正文节点数：'+safeNumber('lastAssistantParentBodyNodes')};
     }
     if(m.command==='status'){
-      const s=await runtime();const k=await config();
+      // Read-only diagnostic. No injection, binding, Host POST, or Weixin request.
+      const s=await runtime(),k=await config();
+      let host='离线',unresolved=false,queueKnown=false,ownerMatched=false;
+      const keyOk=/^[a-f0-9]{64}$/.test(k.localBridgeKey||'');
+      try{
+        const response=await fetch(ROOT+'/health',{
+          method:'GET',signal:AbortSignal.timeout(2500)
+        });
+        if(response.ok){
+          const health=await response.json();
+          host=health?.ok===true&&health.host==='HOST_READY'?'已收到浏览器心跳':
+            health?.ok===true&&health.host==='HOST_UNVERIFIED'?'Host 在线、浏览器心跳未验证':
+            '健康状态异常';
+          const q=health?.queue||{};
+          const knownStates=new Set(['QUEUED','ASSIGNED_UNKNOWN','BROWSER_SUBMITTED',
+            'DELIVERY_UNKNOWN','SUCCEEDED','REVIEWED_NO_REPLAY']);
+          queueKnown=health?.queue&&typeof health.queue==='object'&&
+            !Array.isArray(health.queue)&&Object.entries(q).every(([name,count])=>
+              knownStates.has(name)&&Number.isSafeInteger(count)&&count>=0);
+          unresolved=!queueKnown||['QUEUED','ASSIGNED_UNKNOWN','BROWSER_SUBMITTED','DELIVERY_UNKNOWN']
+            .some(name=>Number.isSafeInteger(q[name])&&q[name]>0);
+        }
+      }catch{}
+      let tab='未绑定';
+      if(Number.isSafeInteger(s.boundTabId)&&validUrl(s.boundUrl)){
+        try{
+          const found=await chrome.tabs.get(s.boundTabId);
+          if(found.url!==s.boundUrl)tab='已绑定页面发生变化';
+          else if(s.activeEventId)tab='任务处理中（不干扰）';
+          else{
+            try{
+              const check=await chrome.tabs.sendMessage(s.boundTabId,{
+                action:'preflight',boundUrl:s.boundUrl
+              });
+              tab=check?.receiverVersion!==8?'接收脚本版本不匹配':
+                check.ready===true?'接收脚本与页面可用':
+                ['ASSISTANT_GENERATING','PAGE_BUSY'].includes(check.reason)
+                ?'页面正在生成或忙碌':'页面暂未就绪';
+            }catch{tab='页面接收脚本未响应';}
+          }
+        }catch{tab='已绑定标签页不存在';}
+      }
+      if(keyOk&&Number.isSafeInteger(s.boundTabId)&&s.boundTabId>0&&validUrl(s.boundUrl)){
+        try{
+          const response=await fetch(ROOT+'/extension/owner-status',{
+            method:'GET',
+            headers:{authorization:'Bearer '+k.localBridgeKey,
+              'x-bridge-tab-id':String(s.boundTabId),'x-bridge-url':s.boundUrl},
+            signal:AbortSignal.timeout(2500)
+          });
+          if(response.ok){
+            const proof=await response.json();
+            ownerMatched=proof?.host==='HOST_READY'&&proof.ownerMatches===true&&
+              proof.pendingBrowserDelivery===false;
+          }
+        }catch{}
+      }
+      const canClaimLocal=keyOk&&s.armed===true&&host==='已收到浏览器心跳'&&
+        tab==='接收脚本与页面可用'&&queueKnown&&!unresolved&&!s.activeEventId&&ownerMatched;
+      const detail=[
+        '本地密钥：'+(keyOk?'已配置':'未配置'),
+        'Host：'+host,
+        'Host 所属标签页：'+(ownerMatched?'与本扩展精确匹配':'尚未核验或不匹配'),
+        '浏览器页面：'+tab,
+        '扩展监听：'+(s.armed===true?'已启动':'已停止'),
+        '未决任务：'+(!queueKnown?'Host 状态未知':unresolved||Boolean(s.activeEventId)?'需要等待或人工核查':'未发现'),
+        '本地检查：'+(canClaimLocal?'基础条件正常（尚未验证微信实收）':s.activeEventId?'正在处理任务（不应重启或重发）':'未完全就绪')
+      ];
       const failure=s.lastFailure;
-      return {message:'密钥：'+(k.localBridgeKey?'已配置':'未配置')+'\n标签页：'+(s.boundTabId||'未绑定')+'\n状态：'+(s.armed?'已启动（实际就绪需看本地状态）':'已停止')+(failure?'\n上次失败阶段：'+failure.stage+'\n错误码：'+failure.code:'')};
+      if(failure && /^[A-Z0-9_:-]{1,90}$/.test(failure.code||''))
+        detail.push('最近错误码：'+failure.code);
+      return {message:detail.join('\n')};
     }
     if(['submitted','completed','delivery-unknown'].includes(m.command)){
       const s=await runtime();
